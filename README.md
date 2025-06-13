@@ -1,71 +1,81 @@
-# UDP Bandwidth Test Tool
+# UDP Traffic Testing System
 
-A simple tool for testing UDP bandwidth and packet timing between a client and server.
+A high-performance UDP-based traffic testing system for measuring network performance metrics.
+
+## Features
+
+- Multi-threaded UDP client and server
+- Configurable number of parallel flows
+- Detailed packet-level metrics collection
+- Real-time performance monitoring
+- Post-processing analysis and visualization
+- Support for high-throughput testing (200+ Mbps)
 
 ## Requirements
 
-- Python 3.x
-- No additional dependencies required
+- Python 3.8+
+- Linux OS (recommended for optimal performance)
+- Required Python packages (see requirements.txt)
+
+## Installation
+
+1. Clone the repository
+2. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
 
 ## Usage
 
-### Server
-
-Start the server first:
+### Starting the Server
 
 ```bash
-python udp_server.py --ip <IP_ADDRESS> --port <PORT> --output_dir <OUTPUT_DIRECTORY> [-R] [--bandwidth <BANDWIDTH_MBPS>] [--duration <SECONDS>]
+python udp_server.py --port 5000 --log-file server_log.csv
 ```
 
-Examples:
-```bash
-# Normal mode (server receives data)
-python udp_server.py --ip 0.0.0.0 --port 5000 --output_dir logs
-
-# Reverse mode (server sends data)
-python udp_server.py --ip 0.0.0.0 --port 5000 --output_dir logs -R --bandwidth 100 --duration 30
-```
-
-### Client
-
-Run the client to send or receive test traffic:
+### Running the Client
 
 ```bash
-python udp_client.py --ip <SERVER_IP> --port <SERVER_PORT> [--bandwidth <BANDWIDTH_MBPS>] [--connections <NUM_CONNECTIONS>] [--duration <SECONDS>] [-R]
+python udp_client.py --server-ip 127.0.0.1 --server-port 5000 --flows 4 --duration 10 --rate 50
 ```
 
-Examples:
+### Analyzing Results
+
 ```bash
-# Normal mode (client sends data)
-python udp_client.py --ip 127.0.0.1 --port 5000 --bandwidth 100 --connections 4 --duration 30
-
-# Reverse mode (client receives data)
-python udp_client.py --ip 127.0.0.1 --port 5000 --connections 4 --duration 30 -R
+python analyze_results.py --client-log client_log.csv --server-log server_log.csv
 ```
 
-Parameters:
-- `--ip`: Server IP address
-- `--port`: Server port
-- `--bandwidth`: Total bandwidth in Mbps (required in send mode)
-- `--connections`: Number of parallel connections (default: 1)
+## Configuration Options
+
+### Server Options
+- `--port`: UDP port to listen on (default: 5000)
+- `--log-file`: Output file for server logs (default: server_log.csv)
+
+### Client Options
+- `--server-ip`: Server IP address (default: 127.0.0.1)
+- `--server-port`: Server port (default: 5000)
+- `--flows`: Number of parallel flows (default: 4)
 - `--duration`: Test duration in seconds (default: 10)
-- `-R, --reverse`: Run in reverse mode (client receives data)
+- `--rate`: Target rate per flow in Mbps (default: 50)
+- `--packet-size`: UDP packet size in bytes (default: 1400)
+- `--log-file`: Output file for client logs (default: client_log.csv)
 
 ## Output
 
-The server/client generates CSV log files with the following columns:
-- packet_number: Sequential packet number
-- recv_time_ns: Reception timestamp in nanoseconds
-- inter_packet_delay_ns: Time between consecutive packets in nanoseconds
+The system generates two main log files:
+1. Server log: Contains packet reception and ACK transmission details
+2. Client log: Contains packet transmission and ACK reception details
 
-## Modes
+Analysis results are saved in the `results` directory, including:
+- Throughput over time
+- Packet loss statistics
+- RTT distribution
+- Jitter analysis
+- Flow-specific metrics
 
-1. Normal Mode (default):
-   - Client sends data to server
-   - Server receives and logs data
-   - Requires bandwidth specification on client
+## Performance Considerations
 
-2. Reverse Mode (-R):
-   - Server sends data to client
-   - Client receives and logs data
-   - Requires bandwidth specification on server
+- For optimal performance, run on Linux systems
+- Adjust system UDP buffer sizes if needed
+- Consider using multiple network interfaces for higher throughput
+- Monitor system resources during high-load tests 
