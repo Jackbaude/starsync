@@ -36,9 +36,8 @@ class UDPClient:
         self.packet_interval = 1.0 / self.packets_per_second
         
         self.stats = {
-            'packets_sent': 0,
             'packets_received': 0,
-            'bytes_sent': 0,
+            'bytes_received': 0,
             'start_time': None,
             'last_stats_time': None,
             'flow_stats': {}
@@ -55,9 +54,9 @@ class UDPClient:
                     'timestamp',
                     'flow_id',
                     'sequence_number',
-                    'send_time',
-                    'server_recv_time',
-                    'ack_time',
+                    'request_time',
+                    'server_send_time',
+                    'receive_time',
                     'rtt_ms'
                 ])
         except Exception as e:
@@ -70,90 +69,92 @@ class UDPClient:
             self.flow_id = flow_id
             self.transport = None
             self.sequence_number = 0
-            self.pending_packets = {}
+            self.pending_requests = {}
             self.start_time = None
             self.is_running = False
+            self.next_request_time = 0
 
         def connection_made(self, transport):
             self.transport = transport
             self.start_time = time.time()
+            self.next_request_time = self.start_time
             self.is_running = True
             logger.info(f"Flow {self.flow_id}: Connected to server {self.client.server_ip}:{self.client.server_port}")
 
         def datagram_received(self, data, addr):
             try:
-                # Parse ACK packet
-                seq_num, client_timestamp, server_timestamp = struct.unpack('!Qdd', data)
+                # Parse data packet
+                seq_num, request_time, server_send_time = struct.unpack('!Qdd', data[:24])
+                payload = data[24:]
                 
                 # Calculate RTT
                 current_time = time.time()
-                rtt = (current_time - client_timestamp) * 1000  # Convert to milliseconds
+                rtt = (current_time - request_time) * 1000  # Convert to milliseconds
                 
                 # Update statistics
                 self.client.stats['packets_received'] += 1
+                self.client.stats['bytes_received'] += len(data)
                 
-                # Log ACK reception
+                # Log packet reception
                 self.client.log_packet(
                     self.flow_id,
                     seq_num,
-                    client_timestamp,
-                    server_timestamp,
+                    request_time,
+                    server_send_time,
                     current_time,
                     rtt
                 )
                 
-                # Remove from pending packets
-                if seq_num in self.pending_packets:
-                    del self.pending_packets[seq_num]
+                # Remove from pending requests
+                if seq_num in self.pending_requests:
+                    del self.pending_requests[seq_num]
+                
+                # Send ACK
+                ack_data = struct.pack('!Qd', seq_num, current_time)
+                self.transport.sendto(ack_data, addr)
                 
             except Exception as e:
-                logger.error(f"Flow {self.flow_id}: Error processing ACK: {e}")
+                logger.error(f"Flow {self.flow_id}: Error processing data packet: {e}")
 
-        async def send_packets(self):
-            """Send packets at the specified rate"""
+        async def request_data(self):
+            """Request data packets from the server at the specified rate"""
             if not self.is_running:
                 logger.error(f"Flow {self.flow_id}: Protocol not connected")
                 return
 
-            next_send_time = time.time()
-            logger.info(f"Flow {self.flow_id}: Starting to send packets at {self.client.packets_per_second:.2f} packets/sec")
+            logger.info(f"Flow {self.flow_id}: Starting to request data at {self.client.packets_per_second:.2f} packets/sec")
             
             try:
                 while time.time() - self.start_time < self.client.duration and self.is_running:
                     current_time = time.time()
                     
-                    if current_time >= next_send_time:
-                        # Create packet with sequence number and timestamp
-                        packet_data = struct.pack('!Qd', self.sequence_number, current_time)
-                        packet_data += b'x' * (self.client.packet_size - len(packet_data))
+                    if current_time >= self.next_request_time:
+                        # Create request packet with sequence number and timestamp
+                        request_data = struct.pack('!Qd', self.sequence_number, current_time)
                         
-                        # Send packet
-                        self.transport.sendto(packet_data, (self.client.server_ip, self.client.server_port))
+                        # Send request
+                        self.transport.sendto(request_data, (self.client.server_ip, self.client.server_port))
                         
-                        # Update statistics
-                        self.client.stats['packets_sent'] += 1
-                        self.client.stats['bytes_sent'] += len(packet_data)
-                        
-                        # Store packet info for RTT calculation
-                        self.pending_packets[self.sequence_number] = current_time
+                        # Store request info for RTT calculation
+                        self.pending_requests[self.sequence_number] = current_time
                         
                         # Update sequence number
                         self.sequence_number += 1
                         
-                        # Calculate next send time
-                        next_send_time += self.client.packet_interval
+                        # Calculate next request time
+                        self.next_request_time += self.client.packet_interval
                     
                     # Small sleep to prevent busy waiting
                     await asyncio.sleep(0.0001)
                 
-                logger.info(f"Flow {self.flow_id}: Finished sending {self.sequence_number} packets")
+                logger.info(f"Flow {self.flow_id}: Finished requesting {self.sequence_number} packets")
                 
             except Exception as e:
-                logger.error(f"Flow {self.flow_id}: Error in send_packets: {e}")
+                logger.error(f"Flow {self.flow_id}: Error in request_data: {e}")
                 raise
 
-    def log_packet(self, flow_id: int, seq_num: int, send_time: float,
-                  server_recv_time: float, ack_time: float, rtt: float):
+    def log_packet(self, flow_id: int, seq_num: int, request_time: float,
+                  server_send_time: float, receive_time: float, rtt: float):
         """Log packet information to CSV file"""
         try:
             with open(self.log_file, 'a', newline='') as f:
@@ -162,9 +163,9 @@ class UDPClient:
                     datetime.now().isoformat(),
                     flow_id,
                     seq_num,
-                    send_time,
-                    server_recv_time,
-                    ack_time,
+                    request_time,
+                    server_send_time,
+                    receive_time,
                     rtt
                 ])
         except Exception as e:
@@ -196,15 +197,15 @@ class UDPClient:
                     sock=sock
                 )
                 
-                # Start sending packets
-                task = asyncio.create_task(protocol.send_packets())
+                # Start requesting data
+                task = asyncio.create_task(protocol.request_data())
                 tasks.append(task)
             
             # Start statistics reporting
             stats_task = asyncio.create_task(self.report_stats())
             
             logger.info(f"Starting {self.num_flows} flows to {self.server_ip}:{self.server_port}")
-            logger.info(f"Target bandwidth: {self.bandwidth_mbps} Mbps per flow")
+            logger.info(f"Target download bandwidth: {self.bandwidth_mbps} Mbps per flow")
             logger.info(f"Test duration: {self.duration} seconds")
             
             # Wait for all flows to complete
@@ -228,15 +229,15 @@ class UDPClient:
                 elapsed = current_time - self.stats['last_stats_time']
                 
                 if elapsed > 0:
-                    packets_per_sec = self.stats['packets_sent'] / elapsed
-                    bytes_per_sec = self.stats['bytes_sent'] / elapsed
+                    packets_per_sec = self.stats['packets_received'] / elapsed
+                    bytes_per_sec = self.stats['bytes_received'] / elapsed
                     mbps = (bytes_per_sec * 8) / 1_000_000
                     
                     logger.info(f"Stats: {packets_per_sec:.2f} packets/sec, {mbps:.2f} Mbps")
                     
                     # Reset counters
-                    self.stats['packets_sent'] = 0
-                    self.stats['bytes_sent'] = 0
+                    self.stats['packets_received'] = 0
+                    self.stats['bytes_received'] = 0
                     self.stats['last_stats_time'] = current_time
             except Exception as e:
                 logger.error(f"Error in stats reporting: {e}")
@@ -244,16 +245,16 @@ class UDPClient:
     def print_final_stats(self):
         """Print final statistics after test completion"""
         total_time = time.time() - self.stats['start_time']
-        total_bytes = self.stats['bytes_sent']
-        total_packets = self.stats['packets_sent']
+        total_bytes = self.stats['bytes_received']
+        total_packets = self.stats['packets_received']
         
         avg_throughput = (total_bytes * 8) / (total_time * 1_000_000)  # Mbps
         avg_packets_per_sec = total_packets / total_time
         
         logger.info("\nFinal Statistics:")
         logger.info(f"Total duration: {total_time:.2f} seconds")
-        logger.info(f"Total packets sent: {total_packets}")
-        logger.info(f"Average throughput: {avg_throughput:.2f} Mbps")
+        logger.info(f"Total packets received: {total_packets}")
+        logger.info(f"Average download throughput: {avg_throughput:.2f} Mbps")
         logger.info(f"Average packets per second: {avg_packets_per_sec:.2f}")
 
 def main():
@@ -267,7 +268,7 @@ def main():
     parser.add_argument('--duration', type=int, default=10,
                       help='Test duration in seconds')
     parser.add_argument('--bandwidth', type=float, default=50,
-                      help='Target bandwidth per flow in Mbps')
+                      help='Target download bandwidth per flow in Mbps')
     parser.add_argument('--packet-size', type=int, default=1400,
                       help='UDP packet size in bytes')
     parser.add_argument('--log-file', type=str, default='client_log.csv',

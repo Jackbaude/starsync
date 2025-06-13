@@ -3,15 +3,15 @@
 import asyncio
 import argparse
 import csv
-import json
 import logging
 import socket
 import struct
 import time
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 import os
 import sys
+from tqdm import tqdm
 
 # Configure logging
 logging.basicConfig(
@@ -21,18 +21,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class UDPServer:
-    def __init__(self, port: int, log_file: str):
+    def __init__(self, host: str, port: int, packet_size: int, log_file: str):
+        self.host = host
         self.port = port
+        self.packet_size = packet_size
         self.log_file = log_file
-        self.transport = None
-        self.protocol = None
+        
         self.stats = {
-            'packets_received': 0,
             'packets_sent': 0,
-            'bytes_received': 0,
+            'bytes_sent': 0,
             'start_time': None,
             'last_stats_time': None,
-            'flow_stats': {}
+            'client_stats': {}
         }
         
         # Create results directory if it doesn't exist
@@ -44,12 +44,12 @@ class UDPServer:
                 writer = csv.writer(f)
                 writer.writerow([
                     'timestamp',
-                    'source_ip',
-                    'source_port',
+                    'client_addr',
                     'sequence_number',
-                    'client_timestamp',
-                    'server_timestamp',
-                    'payload_length'
+                    'request_time',
+                    'send_time',
+                    'ack_time',
+                    'rtt_ms'
                 ])
         except Exception as e:
             logger.error(f"Failed to initialize log file: {e}")
@@ -59,110 +59,152 @@ class UDPServer:
         def __init__(self, server):
             self.server = server
             self.transport = None
+            self.pending_packets = {}  # Track packets waiting for ACK
+            self.client_sequence_numbers = {}  # Track sequence numbers per client
 
         def connection_made(self, transport):
             self.transport = transport
-            logger.info(f"Server started and listening on port {self.server.port}")
+            logger.info(f"Server listening on {self.server.host}:{self.server.port}")
 
         def datagram_received(self, data, addr):
             try:
-                # Parse packet header (sequence number and timestamp)
-                seq_num, client_timestamp = struct.unpack('!Qd', data[:16])
-                payload = data[16:]
-                
-                # Get current timestamp
-                server_timestamp = time.time()
-                
-                # Create ACK packet
-                ack_data = struct.pack('!Qdd', seq_num, client_timestamp, server_timestamp)
-                
-                # Send ACK
-                self.transport.sendto(ack_data, addr)
-                
-                # Update statistics
-                self.server.stats['packets_received'] += 1
-                self.server.stats['bytes_received'] += len(data)
-                
-                # Update flow statistics
-                flow_key = f"{addr[0]}:{addr[1]}"
-                if flow_key not in self.server.stats['flow_stats']:
-                    self.server.stats['flow_stats'][flow_key] = {
-                        'packets_received': 0,
-                        'bytes_received': 0,
-                        'last_seq': None
+                if len(data) == 16:  # Request packet
+                    # Parse request packet
+                    seq_num, request_time = struct.unpack('!Qd', data)
+                    
+                    # Get or initialize client sequence number
+                    if addr not in self.client_sequence_numbers:
+                        self.client_sequence_numbers[addr] = 0
+                    
+                    # Create data packet
+                    current_time = time.time()
+                    packet_data = struct.pack('!Qdd', seq_num, request_time, current_time)
+                    # Add payload to reach desired packet size
+                    packet_data += b'x' * (self.server.packet_size - len(packet_data))
+                    
+                    # Send data packet
+                    self.transport.sendto(packet_data, addr)
+                    
+                    # Update statistics
+                    self.server.stats['packets_sent'] += 1
+                    self.server.stats['bytes_sent'] += len(packet_data)
+                    
+                    # Store packet info for RTT calculation
+                    self.pending_packets[(addr, seq_num)] = {
+                        'request_time': request_time,
+                        'send_time': current_time
                     }
-                
-                flow_stats = self.server.stats['flow_stats'][flow_key]
-                flow_stats['packets_received'] += 1
-                flow_stats['bytes_received'] += len(data)
-                
-                # Check for packet reordering
-                if flow_stats['last_seq'] is not None and seq_num < flow_stats['last_seq']:
-                    logger.warning(f"Packet reordering detected: seq {seq_num} after {flow_stats['last_seq']}")
-                flow_stats['last_seq'] = seq_num
-                
-                # Log packet information
-                self.server.log_packet(addr, seq_num, client_timestamp, server_timestamp, len(data))
+                    
+                    # Log packet send
+                    self.server.log_packet(
+                        addr,
+                        seq_num,
+                        request_time,
+                        current_time,
+                        None,  # ACK time not yet received
+                        None   # RTT not yet calculated
+                    )
+                    
+                elif len(data) == 16:  # ACK packet
+                    # Parse ACK packet
+                    seq_num, ack_time = struct.unpack('!Qd', data)
+                    
+                    # Calculate RTT
+                    if (addr, seq_num) in self.pending_packets:
+                        packet_info = self.pending_packets[(addr, seq_num)]
+                        rtt = (ack_time - packet_info['request_time']) * 1000  # Convert to milliseconds
+                        
+                        # Update log with ACK time and RTT
+                        self.server.update_packet_log(
+                            addr,
+                            seq_num,
+                            ack_time,
+                            rtt
+                        )
+                        
+                        # Remove from pending packets
+                        del self.pending_packets[(addr, seq_num)]
                 
             except Exception as e:
-                logger.error(f"Error processing packet: {e}")
+                logger.error(f"Error processing packet from {addr}: {e}")
 
-    def log_packet(self, addr, seq_num, client_timestamp, server_timestamp, payload_length):
+    def log_packet(self, client_addr: tuple, seq_num: int, request_time: float,
+                  send_time: float, ack_time: Optional[float], rtt: Optional[float]):
         """Log packet information to CSV file"""
         try:
             with open(self.log_file, 'a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     datetime.now().isoformat(),
-                    addr[0],
-                    addr[1],
+                    f"{client_addr[0]}:{client_addr[1]}",
                     seq_num,
-                    client_timestamp,
-                    server_timestamp,
-                    payload_length
+                    request_time,
+                    send_time,
+                    ack_time if ack_time is not None else '',
+                    rtt if rtt is not None else ''
                 ])
         except Exception as e:
             logger.error(f"Failed to log packet: {e}")
+
+    def update_packet_log(self, client_addr: tuple, seq_num: int, ack_time: float, rtt: float):
+        """Update existing log entry with ACK time and RTT"""
+        try:
+            # Read all lines
+            with open(self.log_file, 'r', newline='') as f:
+                lines = list(csv.reader(f))
+            
+            # Find and update the matching entry
+            for i, line in enumerate(lines[1:], 1):  # Skip header
+                if (line[1] == f"{client_addr[0]}:{client_addr[1]}" and 
+                    int(line[2]) == seq_num):
+                    lines[i][5] = str(ack_time)  # ACK time
+                    lines[i][6] = str(rtt)       # RTT
+                    break
+            
+            # Write back all lines
+            with open(self.log_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerows(lines)
+                
+        except Exception as e:
+            logger.error(f"Failed to update packet log: {e}")
 
     async def start(self):
         """Start the UDP server"""
         try:
             loop = asyncio.get_running_loop()
             
-            # Create UDP socket
+            self.stats['start_time'] = time.time()
+            self.stats['last_stats_time'] = self.stats['start_time']
+            
+            # Create socket
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             
             # Increase socket buffer sizes
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)  # 1MB receive buffer
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)  # 1MB send buffer
-            
-            # Bind socket
-            sock.bind(('0.0.0.0', self.port))
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
             
             # Create protocol and transport
-            self.protocol = self.ServerProtocol(self)
-            self.transport, _ = await loop.create_datagram_endpoint(
-                lambda: self.protocol,
-                sock=sock
+            protocol = self.ServerProtocol(self)
+            transport, _ = await loop.create_datagram_endpoint(
+                lambda: protocol,
+                sock=sock,
+                local_addr=(self.host, self.port)
             )
             
-            self.stats['start_time'] = time.time()
-            self.stats['last_stats_time'] = self.stats['start_time']
-            
-            logger.info(f"UDP Server started on port {self.port}")
-            
             # Start statistics reporting
-            asyncio.create_task(self.report_stats())
+            stats_task = asyncio.create_task(self.report_stats())
             
-            # Keep the server running
+            logger.info(f"Server started on {self.host}:{self.port}")
+            logger.info(f"Packet size: {self.packet_size} bytes")
+            
+            # Keep server running
             while True:
                 await asyncio.sleep(1)
-                
+            
         except Exception as e:
             logger.error(f"Server error: {e}")
-            if self.transport:
-                self.transport.close()
             raise
 
     async def report_stats(self):
@@ -175,28 +217,38 @@ class UDPServer:
                 elapsed = current_time - self.stats['last_stats_time']
                 
                 if elapsed > 0:
-                    packets_per_sec = self.stats['packets_received'] / elapsed
-                    bytes_per_sec = self.stats['bytes_received'] / elapsed
+                    packets_per_sec = self.stats['packets_sent'] / elapsed
+                    bytes_per_sec = self.stats['bytes_sent'] / elapsed
                     mbps = (bytes_per_sec * 8) / 1_000_000
                     
                     logger.info(f"Stats: {packets_per_sec:.2f} packets/sec, {mbps:.2f} Mbps")
                     
                     # Reset counters
-                    self.stats['packets_received'] = 0
-                    self.stats['bytes_received'] = 0
+                    self.stats['packets_sent'] = 0
+                    self.stats['bytes_sent'] = 0
                     self.stats['last_stats_time'] = current_time
             except Exception as e:
                 logger.error(f"Error in stats reporting: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description='UDP Server for Traffic Testing')
-    parser.add_argument('--port', type=int, default=5000, help='UDP port to listen on')
+    parser.add_argument('--host', type=str, default='0.0.0.0',
+                      help='Server host address')
+    parser.add_argument('--port', type=int, default=5000,
+                      help='Server port')
+    parser.add_argument('--packet-size', type=int, default=1400,
+                      help='UDP packet size in bytes')
     parser.add_argument('--log-file', type=str, default='server_log.csv',
                       help='Output file for server logs')
     
     args = parser.parse_args()
     
-    server = UDPServer(args.port, args.log_file)
+    server = UDPServer(
+        args.host,
+        args.port,
+        args.packet_size,
+        args.log_file
+    )
     
     try:
         asyncio.run(server.start())
