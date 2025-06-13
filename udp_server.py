@@ -185,12 +185,14 @@ class UDPServer:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
             
+            # Bind socket
+            sock.bind((self.host, self.port))
+            
             # Create protocol and transport
             protocol = self.ServerProtocol(self)
             transport, _ = await loop.create_datagram_endpoint(
                 lambda: protocol,
-                sock=sock,
-                local_addr=(self.host, self.port)
+                sock=sock
             )
             
             # Start statistics reporting
