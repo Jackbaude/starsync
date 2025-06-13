@@ -26,7 +26,8 @@ def send_packets(ip, port, bandwidth_bps, thread_id, duration, packet_size=1400)
 
 def receive_packets(ip, port, output_dir, thread_id, duration):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((ip, port))
+    # Bind to local address instead of server address
+    sock.bind(('0.0.0.0', 0))  # Use any available local port
     
     # Send initial packet to establish connection
     sock.sendto(b'start', (ip, port))
